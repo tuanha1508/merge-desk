@@ -1,0 +1,12 @@
+/node_modules
+/.next
+/out
+
+# Design-tool scratch: mock exports, review screenshots, question logs. The
+# artboards themselves live in the Paper file, which is the source of truth.
+/.impeccable
+.env
+.env*.local
+*.tsbuildinfo
+next-env.d.ts
+.vercel
