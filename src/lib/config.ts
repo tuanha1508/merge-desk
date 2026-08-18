@@ -49,6 +49,7 @@ export const config = {
     | "rebase",
   requireGreenCI: (env("REQUIRE_GREEN_CI") ?? "true") !== "false",
   blockingBots: list("BLOCKING_BOTS").map((b) => b.toLowerCase()),
+  githubWebhookSecret: env("GITHUB_WEBHOOK_SECRET"),
 
   linearApiKey: env("LINEAR_API_KEY"),
 

@@ -81,11 +81,10 @@ export async function proxy(request: NextRequest) {
 export const config = {
   matcher: [
     /*
-      Everything except: the sign-in page and its endpoint, Slack's two routes
-      (Slack signs its interactivity payloads and the publish endpoint carries
-      its own bearer secret - neither can present our cookie), and static
-      assets.
+      Everything except: the sign-in page and its endpoint, Slack's two routes,
+      GitHub's webhook receiver, and static assets. External services cannot
+      present our login cookie; each exempt endpoint verifies its own secret.
     */
-    "/((?!login|api/login|api/slack|_next/static|_next/image|icon.png|favicon.ico).*)",
+    "/((?!login|api/login|api/slack|api/github/webhook|_next/static|_next/image|icon.png|favicon.ico).*)",
   ],
 };
