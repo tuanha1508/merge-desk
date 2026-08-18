@@ -12,8 +12,9 @@ Two actions per row: **Merge** and **View PR**. Nothing else.
 ## What it does
 
 - **Queue** — open PRs across `GITHUB_REPOS`, newest activity on top, capped at
-  50 and limited to the last 7 days of activity. Auto-polls every 3 minutes
-  while the tab is visible (10 minutes when hidden).
+  50 and limited to the last 7 days of activity. Updates live over Supabase
+  Realtime the instant a webhook or merge changes it, and auto-polls every 3
+  minutes (10 when hidden) as a safety net.
 - **Customer** — resolves a reachable contact for each PR: Linear CRM → ticket
   text → PostHog / Supabase by name or domain → ticket screenshots (name,
   email, or phone) when structured fields leave it unresolved. Ambiguous
@@ -67,6 +68,13 @@ indicator. A 45-second memory cache sits in front of a shared Supabase snapshot,
 so cold Vercel instances render without repeating GitHub, Linear, and customer
 lookups. Webhooks patch that snapshot directly; a full reconciliation every 15
 minutes repairs missed deliveries.
+
+When a webhook or merge changes the queue, the server broadcasts a small
+data-free ping on a Supabase Realtime channel and every open board refreshes
+within a second — no waiting for the next poll. Set `NEXT_PUBLIC_SUPABASE_URL`
+and `NEXT_PUBLIC_SUPABASE_ANON_KEY` to enable it; leave them blank to fall back
+to polling only. The anon key is safe in the browser: the ping carries no PR
+data, and row-level security keeps that key out of every table.
 
 Queue rows and generated summaries expire after 7 days. Closed or merged PRs
 are deleted immediately, and expired rows are cleaned daily. The migration
