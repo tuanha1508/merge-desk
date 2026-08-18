@@ -52,6 +52,13 @@ const TITLES: Record<Filter, string> = {
 const POLL_VISIBLE_MS = 3 * 60_000;
 const POLL_HIDDEN_MS = 10 * 60_000;
 
+/*
+  How long the detail view holds on "Merged" before it returns to the board.
+  Long enough to register the confirmation, short enough that it still feels
+  like one action - and it lands before the row's 700ms exit hold begins.
+*/
+const MERGE_RETURN_MS = 900;
+
 type RefreshKind = "full" | "gates" | "vision";
 
 export function Rundown({
@@ -238,12 +245,15 @@ export function Rundown({
     setGoneIds((prev) => new Set(prev).add(id));
   }
 
+  // Stable so the detail view's return timer survives a poll re-render.
+  const closeDetail = useCallback(() => setOpenId(null), []);
+
   if (opened) {
     return (
       <Detail
         item={opened.item}
         status={opened.status}
-        onBack={() => setOpenId(null)}
+        onBack={closeDetail}
         onMerged={() => markMerged(opened.item.id)}
       />
     );
@@ -922,6 +932,23 @@ function Detail({
   const repoName = item.repo.split("/")[1] ?? item.repo;
   const merged = state === "merged" || status === "merged";
 
+  /*
+    Merging is the last thing anyone does on this page, so the view returns to
+    the board by itself rather than leaving a dead "Merged" button on screen.
+    The pause is long enough to read the confirmation; back on the list the row
+    is already marked merged, so it picks up its slide-out from there.
+
+    Only a merge performed here schedules the return - arriving at a row that
+    was already merged must not bounce the reader straight back out.
+  */
+  const [returning, setReturning] = useState(false);
+
+  useEffect(() => {
+    if (!returning) return;
+    const id = setTimeout(onBack, MERGE_RETURN_MS);
+    return () => clearTimeout(id);
+  }, [returning, onBack]);
+
   async function merge() {
     setState("merging");
     setMessage(null);
@@ -936,6 +963,7 @@ function Detail({
         setState("merged");
         setMessage(data.message ?? null);
         onMerged();
+        setReturning(true);
       } else {
         setState("error");
         setMessage(data.message ?? "The merge did not go through.");
