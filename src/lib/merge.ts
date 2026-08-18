@@ -1,6 +1,7 @@
 import { config, isMockMode } from "./config";
 import { evaluateGate, mergePR } from "./github";
 import { invalidateQueueCache, removeQueueItemEverywhere } from "./queue";
+import { broadcastQueueChanged } from "./realtime";
 import type { MergeResult } from "./types";
 
 export interface QueueMergeResult {
@@ -82,6 +83,9 @@ export async function mergeQueueItem(
   if (merged.merged) {
     invalidateQueueCache();
     await removeQueueItemEverywhere(repo, number);
+    // Nudge other open boards to drop the row now, not on their next poll. The
+    // client that clicked already animates it out from the merge response.
+    void broadcastQueueChanged("merged");
   }
   return {
     result: { ok: merged.merged, ...merged },

@@ -7,9 +7,11 @@ import {
   deleteStoredQueueItem,
   loadStoredQueue,
   loadStoredQueueItem,
+  markStoredQueueSynced,
   replaceStoredQueue,
   upsertStoredQueueItems,
 } from "./merge-desk-store";
+import { broadcastQueueChanged } from "./realtime";
 import { stripMarkdownNoise } from "./summarize";
 import { mockQueue } from "./mock";
 import type { QueueItem } from "./types";
@@ -563,6 +565,23 @@ async function upsertFromWebhookPR(
  * read reconciles instead of serving something stale.
  */
 export async function applyWebhookEvent(
+  evt: WebhookEvent,
+): Promise<WebhookOutcome> {
+  const outcome = await applyWebhookEventInner(evt);
+
+  // Every real change moves the shared snapshot, so tell open boards to re-read
+  // and keep the freshness marker current for cold-instance reads. Both are
+  // best-effort: a dropped ping just falls back to the next poll.
+  if (outcome.patched) {
+    await markStoredQueueSynced();
+    void broadcastQueueChanged(
+      outcome.action === "skipped" ? "upserted" : outcome.action,
+    );
+  }
+  return outcome;
+}
+
+async function applyWebhookEventInner(
   evt: WebhookEvent,
 ): Promise<WebhookOutcome> {
   if (isMockMode) {

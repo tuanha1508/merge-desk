@@ -251,6 +251,29 @@ async function refreshStoredQueueCount(itemCount: number): Promise<void> {
   );
 }
 
+/**
+ * Stamp the snapshot as synced now.
+ *
+ * A webhook patch keeps an already-complete queue complete (an upsert adds or
+ * replaces one row, a delete drops one), so it is fair to move the freshness
+ * marker forward. Doing so lets a cold Vercel instance serve the patched rows
+ * straight from Postgres on the next read instead of falling through to a full
+ * GitHub reconcile. `loadStoredQueue` still guards on item_count vs. row count,
+ * so a genuinely incomplete set is rejected regardless of this timestamp.
+ */
+export async function markStoredQueueSynced(): Promise<void> {
+  await request(
+    "mark queue synced",
+    config.mergeDeskStateTable,
+    {
+      method: "PATCH",
+      headers: headers("return=minimal"),
+      body: JSON.stringify({ synced_at: new Date().toISOString() }),
+    },
+    new URLSearchParams({ key: "eq.queue" }),
+  );
+}
+
 /** Atomically replace the complete globally capped queue and mark it synced. */
 export async function replaceStoredQueue(items: QueueItem[]): Promise<boolean> {
   if (!enabled()) return false;

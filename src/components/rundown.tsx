@@ -12,6 +12,7 @@ import type { ReactNode } from "react";
 import type { CustomerInfo, QueueItem, TicketFiler } from "@/lib/types";
 import { authorName, headline } from "@/lib/display";
 import { useSummary } from "@/lib/summary-store";
+import { useQueueChannel } from "@/lib/realtime-client";
 import { TicketMarkdown } from "./ticket-markdown";
 import { BossUpdate } from "./boss-update";
 import LoadingState from "./loading-state";
@@ -182,6 +183,19 @@ export function Rundown({
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [refresh]);
+
+  /*
+    Live push. When a webhook or a merge changes the queue, the server sends a
+    broadcast and this refreshes right away - so the board tracks GitHub within
+    a second instead of up to a poll interval. The timer above stays on as a
+    safety net for any ping missed while the socket was reconnecting. Gates mode
+    keeps it cheap: Linear and customer enrichment are reused, only CI and bot
+    threads are re-read.
+  */
+  const onRealtime = useCallback(() => {
+    void refresh(filledRef.current ? "gates" : "full");
+  }, [refresh]);
+  useQueueChannel(onRealtime);
 
   /*
     A row that finished its exit animation is gone from the board immediately,

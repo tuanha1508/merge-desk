@@ -63,6 +63,12 @@ export const config = {
     env("MERGE_DESK_SUMMARY_TABLE") ?? "merge_desk_summaries",
   mergeDeskStateTable:
     env("MERGE_DESK_STATE_TABLE") ?? "merge_desk_state",
+  // Broadcast channel the board subscribes to for live updates. Server pushes
+  // here (service key) when a webhook or merge changes the queue; the browser
+  // listens with the public anon key below. The ping carries no PR data, so
+  // the anon key is safe to expose.
+  realtimeChannel: env("MERGE_DESK_REALTIME_CHANNEL") ?? "merge-desk-queue",
+  supabaseAnonKey: env("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
 
   posthogHost: env("POSTHOG_HOST") ?? env("POSTHOG_APP_HOST") ?? "https://us.posthog.com",
   // Persons search needs the personal API key, not the project key.
