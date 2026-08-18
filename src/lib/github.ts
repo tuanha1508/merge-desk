@@ -22,7 +22,6 @@ export interface RawPR {
   /** Last activity (commit, comment, label...). What "recent" is judged on. */
   updatedAt: string;
   headRef: string;
-  body: string;
   gate: ReviewGate;
 }
 
@@ -125,6 +124,10 @@ function gateFromPullRequest(pr: any, reviewThreads?: any[]): ReviewGate {
  * server is currently available to service your request", failing the whole
  * queue. Nesting the connection costs 51 points of the 5000/hour budget for a
  * full 50-PR page and removes a sequential round trip.
+ *
+ * PR bodies are omitted here on purpose: ticket refs almost always live in the
+ * branch name or title, and the summary path already fetches the body lazily
+ * via getPullRequestContext. Dropping bodies keeps the list payload small.
  */
 export async function listOpenPRs(
   repo: string,
@@ -140,7 +143,7 @@ export async function listOpenPRs(
           orderBy:{field:UPDATED_AT,direction:DESC}
         ){
           nodes{
-            number title url createdAt updatedAt headRefName body
+            number title url createdAt updatedAt headRefName
             author{ login }
             commits(last:1){
               nodes{ commit{ statusCheckRollup{ state } } }
@@ -175,7 +178,6 @@ export async function listOpenPRs(
       createdAt: pr.createdAt,
       updatedAt: pr.updatedAt,
       headRef: pr.headRefName ?? "",
-      body: pr.body ?? "",
       gate: gateFromPullRequest(pr),
     }));
 }

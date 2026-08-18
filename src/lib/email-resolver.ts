@@ -116,6 +116,15 @@ export function extractClues(ticket: LinearTicket | null): Clues {
   };
 }
 
+export interface ResolveCustomerOptions {
+  /**
+   * Screenshot vision is the slowest step in the waterfall. Queue loads skip
+   * it by default so the board paints quickly; "Search again" turns it on for
+   * rows that still have no customer after the structured lookups.
+   */
+  allowVision?: boolean;
+}
+
 /**
  * Resolve customer email:
  *   Linear customer externalIds → ticket email → PostHog by name →
@@ -124,7 +133,9 @@ export function extractClues(ticket: LinearTicket | null): Clues {
  */
 export async function resolveCustomer(
   ticket: LinearTicket | null,
+  options: ResolveCustomerOptions = {},
 ): Promise<CustomerInfo> {
+  const allowVision = options.allowVision === true;
   const trail: string[] = [];
   const clues = extractClues(ticket);
   let name = clues.name;
@@ -248,8 +259,22 @@ export async function resolveCustomer(
     Screenshots are the final fallback, read only for tickets the structured
     fields and prose could not resolve. We ask specifically for the customer
     side and pass our own team's names so an internal person in a chat thread
-    is never taken as the contact.
+    is never taken as the contact. Queue loads leave this off so a page of
+    unresolved tickets does not wait on Anthropic before first paint.
   */
+  if (!allowVision) {
+    trail.push("screenshot vision skipped (fast path)");
+    return {
+      name,
+      email: null,
+      phone,
+      source: candidates.length ? candidates[0].source : "none",
+      verified: false,
+      candidates: dedupe(candidates).slice(0, 5),
+      trail,
+    };
+  }
+
   const internalNames = new Set(
     [
       ...config.ownCompanyNames,

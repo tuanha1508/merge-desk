@@ -12,9 +12,9 @@ const INITIAL_ITEMS = 5;
 
 export default async function Page() {
   /*
-    The proxy only checks that a cookie exists. The signature is verified here,
-    before any queue data is fetched, because this page renders customer names
-    and email addresses straight into the HTML.
+    The proxy verifies the session cookie signature. The page still re-checks
+    here before any queue data is fetched, because this surface renders
+    customer names and email addresses straight into the HTML.
   */
   const jar = await cookies();
   if (!verifySession(jar.get(SESSION_COOKIE)?.value)) redirect("/login");

@@ -1,6 +1,6 @@
 import { config, isMockMode } from "./config";
 import { listOpenPRs, type RawPR } from "./github";
-import { extractTicketRef, getTicket } from "./linear";
+import { extractTicketRef, getTickets } from "./linear";
 import { resolveCustomer } from "./email-resolver";
 import { stripMarkdownNoise } from "./summarize";
 import { mockQueue } from "./mock";
@@ -84,7 +84,7 @@ function decideMerge(item: Omit<QueueItem, "mergeable" | "blockedReason">): {
     const who = item.gate.blockingBots.join(", ");
     reasons.push(
       `${item.gate.unresolvedBotReviews} unresolved bot review${
-        item.gate.unresolvedBotReviews > 1 ? "s" : ""
+        item.gate.unresolvedBotReviews === 1 ? "" : "s"
       }${who ? ` (${who})` : ""}`,
     );
   }
@@ -94,11 +94,18 @@ function decideMerge(item: Omit<QueueItem, "mergeable" | "blockedReason">): {
   };
 }
 
-async function buildItem(pr: RawPR): Promise<QueueItem> {
-  const ref = extractTicketRef(pr.headRef, pr.title, pr.body);
+type TicketMap = Awaited<ReturnType<typeof getTickets>>;
 
-  const ticket = ref ? await getTicket(ref) : null;
-  const customer = await resolveCustomer(ticket);
+async function buildItem(
+  pr: RawPR,
+  tickets: TicketMap,
+  allowVision: boolean,
+): Promise<QueueItem> {
+  // Branch name and title almost always carry the Linear ref; PR body is no
+  // longer pulled on the list query (summaries fetch it lazily).
+  const ref = extractTicketRef(pr.headRef, pr.title);
+  const ticket = ref ? (tickets.get(ref.toUpperCase()) ?? null) : null;
+  const customer = await resolveCustomer(ticket, { allowVision });
 
   const base = {
     id: `${pr.repo}#${pr.number}`,
@@ -117,6 +124,18 @@ async function buildItem(pr: RawPR): Promise<QueueItem> {
     gate: pr.gate,
   };
   return { ...base, ...decideMerge(base) };
+}
+
+function withGate(item: QueueItem, pr: RawPR): QueueItem {
+  const next = {
+    ...item,
+    title: pr.title,
+    author: pr.author,
+    url: pr.url,
+    updatedAt: pr.updatedAt,
+    gate: pr.gate,
+  };
+  return { ...next, ...decideMerge(next) };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -167,37 +186,33 @@ function cachedEntry(maxItems: number): CacheEntry | null {
   return null;
 }
 
+/** Drop cached rows after a successful merge so the next poll rebuilds cleanly. */
+export function invalidateQueueCache(): void {
+  queueCache.clear();
+}
+
 export interface QueueResult {
   mock: boolean;
   items: QueueItem[];
   /** Repos GitHub could not serve. Their rows are absent from `items`. */
   missingRepos: string[];
+  /** Whether this payload reused prior enrichment and only refreshed gates. */
+  mode?: "full" | "gates";
 }
 
-export async function getQueue(options?: {
+export interface GetQueueOptions {
   maxItems?: number;
-}): Promise<QueueResult> {
-  const maxItems = Math.min(
-    Math.max(options?.maxItems ?? config.maxPrs, 1),
-    config.maxPrs,
-  );
-  if (isMockMode) {
-    return {
-      mock: true,
-      items: mockQueue.slice(0, maxItems),
-      missingRepos: [],
-    };
-  }
+  /**
+   * When true, run screenshot vision for unresolved customers. Default false
+   * so first paint and polls stay fast; the UI opts in via "Search again".
+   */
+  allowVision?: boolean;
+}
 
-  const hit = cachedEntry(maxItems);
-  if (hit) {
-    return {
-      mock: false,
-      items: hit.items.slice(0, maxItems),
-      missingRepos: [],
-    };
-  }
-
+async function listAllOpenPRs(maxItems: number): Promise<{
+  capped: RawPR[];
+  missingRepos: string[];
+}> {
   // Asking each repo for maxItems is sufficient to find the global maxItems:
   // no PR ranked below that within its own repo can enter the global top set.
   // This matters for first paint, which asks for only the newest handful and
@@ -216,7 +231,9 @@ export async function getQueue(options?: {
     if (result.status === "fulfilled") return [result.value];
     missingRepos.push(config.repos[index]);
     console.error(
-      `queue: skipping ${config.repos[index]} - ${result.reason instanceof Error ? result.reason.message : result.reason}`,
+      `queue: skipping ${config.repos[index]} - ${
+        result.reason instanceof Error ? result.reason.message : result.reason
+      }`,
     );
     return [];
   });
@@ -230,11 +247,121 @@ export async function getQueue(options?: {
     .flat()
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, maxItems);
+  return { capped, missingRepos };
+}
 
-  // GitHub gates are already batched into the two repository queries above.
-  // Bound the remaining Linear/customer work so one refresh does not burst
-  // those services with 50 simultaneous lookups.
-  const items = await mapWithConcurrency(capped, 8, buildItem);
+async function enrichPRs(
+  capped: RawPR[],
+  allowVision: boolean,
+): Promise<QueueItem[]> {
+  const refs = capped
+    .map((pr) => extractTicketRef(pr.headRef, pr.title))
+    .filter((ref): ref is string => Boolean(ref));
+  const tickets = await getTickets(refs);
+  // GitHub gates are already batched into the repository queries above.
+  // Bound the remaining customer work so one refresh does not burst those
+  // services with 50 simultaneous lookups. Linear was batched separately.
+  return mapWithConcurrency(capped, 8, (pr) =>
+    buildItem(pr, tickets, allowVision),
+  );
+}
+
+export async function getQueue(
+  options?: GetQueueOptions,
+): Promise<QueueResult> {
+  const maxItems = Math.min(
+    Math.max(options?.maxItems ?? config.maxPrs, 1),
+    config.maxPrs,
+  );
+  const allowVision = options?.allowVision === true;
+
+  if (isMockMode) {
+    return {
+      mock: true,
+      items: mockQueue.slice(0, maxItems),
+      missingRepos: [],
+      mode: "full",
+    };
+  }
+
+  // Vision-backed lookups must not reuse a fast-path cache entry that skipped
+  // screenshots - otherwise "Search again" would appear to do nothing.
+  if (!allowVision) {
+    const hit = cachedEntry(maxItems);
+    if (hit) {
+      return {
+        mock: false,
+        items: hit.items.slice(0, maxItems),
+        missingRepos: [],
+        mode: "full",
+      };
+    }
+  }
+
+  const { capped, missingRepos } = await listAllOpenPRs(maxItems);
+  const items = await enrichPRs(capped, allowVision);
+  if (!allowVision) {
+    queueCache.set(maxItems, { at: Date.now(), items, missingRepos });
+  }
+  return { mock: false, items, missingRepos, mode: "full" };
+}
+
+/**
+ * Cheap poll path: re-fetch GitHub gates for the open PR set, reuse Linear /
+ * customer enrichment for rows that are still open, and only buildItem for
+ * brand-new PRs. Falls back to a full getQueue when there is nothing cached.
+ */
+export async function refreshQueueGates(
+  options?: GetQueueOptions,
+): Promise<QueueResult> {
+  const maxItems = Math.min(
+    Math.max(options?.maxItems ?? config.maxPrs, 1),
+    config.maxPrs,
+  );
+
+  if (isMockMode) {
+    return {
+      mock: true,
+      items: mockQueue.slice(0, maxItems),
+      missingRepos: [],
+      mode: "gates",
+    };
+  }
+
+  const prior =
+    cachedEntry(maxItems) ??
+    [...queueCache.entries()]
+      .filter(([, entry]) => Date.now() - entry.at <= CACHE_TTL_MS * 4)
+      .sort((a, b) => b[0] - a[0])[0]?.[1];
+
+  if (!prior || prior.items.length === 0) {
+    return getQueue({ maxItems, allowVision: false });
+  }
+
+  const { capped, missingRepos } = await listAllOpenPRs(maxItems);
+  const priorById = new Map(prior.items.map((item) => [item.id, item]));
+  const next: QueueItem[] = [];
+  const newcomers: RawPR[] = [];
+
+  for (const pr of capped) {
+    const id = `${pr.repo}#${pr.number}`;
+    const existing = priorById.get(id);
+    if (existing) {
+      // Title/ticket material rarely changes between polls; CI and bot threads
+      // do. Reuse enrichment and stamp the fresh gate.
+      next.push(withGate(existing, pr));
+    } else {
+      newcomers.push(pr);
+    }
+  }
+
+  if (newcomers.length > 0) {
+    const built = await enrichPRs(newcomers, false);
+    next.push(...built);
+  }
+
+  next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const items = next.slice(0, maxItems);
   queueCache.set(maxItems, { at: Date.now(), items, missingRepos });
-  return { mock: false, items, missingRepos };
+  return { mock: false, items, missingRepos, mode: "gates" };
 }

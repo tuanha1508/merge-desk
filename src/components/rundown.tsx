@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ReactNode } from "react";
 import type { CustomerInfo, QueueItem, TicketFiler } from "@/lib/types";
 import { authorName, headline } from "@/lib/display";
@@ -39,10 +46,13 @@ const TITLES: Record<Filter, string> = {
   off when the tab is hidden (nobody's reading it that second) and run the
   tighter cadence while it's in focus. Three minutes leaves enough GitHub
   budget for two open tabs plus the ten-minute Slack publisher at the 50-PR
-  ceiling.
+  ceiling. After the first full fill, polls use the gates-only path so Linear
+  and customer lookups are not repeated every tick.
 */
 const POLL_VISIBLE_MS = 3 * 60_000;
 const POLL_HIDDEN_MS = 10 * 60_000;
+
+type RefreshKind = "full" | "gates" | "vision";
 
 export function Rundown({
   items: initialItems,
@@ -68,19 +78,35 @@ export function Rundown({
   */
   const [pending, setPending] = useState(false);
   const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const pendingRef = useRef(false);
+  const filledRef = useRef(false);
 
   // Until the first background fetch lands, the list is only the newest rows
   // the server rendered - so the page has to say more are still coming.
   const [filled, setFilled] = useState(false);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (kind: RefreshKind = "full") => {
     if (pendingRef.current) return;
     pendingRef.current = true;
     setPending(true);
     try {
-      const response = await fetch("/api/queue", { cache: "no-store" });
-      if (!response.ok) return;
+      const params = new URLSearchParams();
+      if (kind === "gates") params.set("mode", "gates");
+      if (kind === "vision") params.set("vision", "1");
+      const query = params.toString();
+      const response = await fetch(
+        query ? `/api/queue?${query}` : "/api/queue",
+        { cache: "no-store" },
+      );
+      if (!response.ok) {
+        setRefreshError(
+          response.status === 401
+            ? "Session expired — sign in again to refresh the queue."
+            : "Could not refresh the queue. Showing the last good load.",
+        );
+        return;
+      }
       const data = (await response.json()) as {
         items?: QueueItem[];
         missingRepos?: string[];
@@ -90,15 +116,23 @@ export function Rundown({
         setMissingRepos(data.missingRepos ?? []);
         setRefreshedAt(Date.now());
         setFilled(true);
+        filledRef.current = true;
+        setRefreshError(null);
       }
     } catch {
       // Keep the already-rendered newest rows. The next poll or a manual
       // refresh can fill the queue when the network recovers.
+      setRefreshError(
+        "Could not reach the queue service. Showing the last good load.",
+      );
     } finally {
       pendingRef.current = false;
       setPending(false);
     }
   }, []);
+
+  const refreshFull = useCallback(() => void refresh("full"), [refresh]);
+  const refreshVision = useCallback(() => void refresh("vision"), [refresh]);
 
   /*
     Auto-poll so the board stays current with no clicks. We hold `pending` in a
@@ -113,7 +147,8 @@ export function Rundown({
 
     const tick = () => {
       if (pendingRef.current) return;
-      void refresh();
+      // First fill needs full enrichment; later ticks only refresh CI/bots.
+      void refresh(filledRef.current ? "gates" : "full");
     };
 
     const arm = () => {
@@ -232,7 +267,7 @@ export function Rundown({
           mock={mock}
           refreshedAt={refreshedAt}
           pending={pending}
-          onRefresh={refresh}
+          onRefresh={refreshFull}
         />
 
         <AuthorTabs
@@ -241,6 +276,12 @@ export function Rundown({
           value={author}
           onChange={setAuthor}
         />
+
+        {refreshError && (
+          <p className="rounded-lg bg-warn-wash px-[14px] py-[10px] text-[13px] leading-[20px] text-warn">
+            {refreshError}
+          </p>
+        )}
 
         {missingRepos.length > 0 && (
           <p className="rounded-lg bg-warn-wash px-[14px] py-[10px] text-[13px] leading-[20px] text-warn">
@@ -266,7 +307,7 @@ export function Rundown({
                     status={status}
                     onOpen={() => setOpenId(item.id)}
                     onMerged={() => markMerged(item.id)}
-                    onSearchAgain={refresh}
+                    onSearchAgain={refreshVision}
                   />
                 </LeavingRow>
               ))
@@ -297,7 +338,7 @@ export function Rundown({
                   status={status}
                   onOpen={() => setOpenId(item.id)}
                   onMerged={() => markMerged(item.id)}
-                  onSearchAgain={refresh}
+                  onSearchAgain={refreshVision}
                 />
               </LeavingRow>
             ))}
@@ -598,14 +639,21 @@ function LeavingRow({
 }
 
 /**
- * The boss update, inline on the row. Kept visually subordinate to the problem
- * above it: this is the sentence to forward, not the thing being scanned for.
- * A failure stays silent here - the row still merges, and the detail view is
- * where the reason belongs.
+ * The boss update, inline on the row. Only fetched for rows that are clear to
+ * merge (and in the detail view) so a long waiting list does not fire dozens
+ * of Anthropic calls on first paint. Failures stay silent here - the row still
+ * merges, and the detail view is where the reason belongs.
  */
-function RowUpdate({ item }: { item: QueueItem }) {
-  const { text, loading } = useSummary(item);
+function RowUpdate({
+  item,
+  enabled,
+}: {
+  item: QueueItem;
+  enabled: boolean;
+}) {
+  const { text, loading } = useSummary(item, { enabled });
 
+  if (!enabled) return null;
   if (loading) {
     return (
       <span className="mt-[3px] flex h-[13px] w-full max-w-[420px] items-center">
@@ -622,7 +670,7 @@ function RowUpdate({ item }: { item: QueueItem }) {
   );
 }
 
-function Row({
+const Row = memo(function Row({
   item,
   status,
   onOpen,
@@ -639,6 +687,7 @@ function Row({
   const [error, setError] = useState<string | null>(null);
   const merged = status === "merged";
   const quiet = status === "waiting" || status === "failing";
+  const wantUpdate = status === "ready";
 
   async function merge() {
     setState("merging");
@@ -729,7 +778,7 @@ function Row({
         <span className="line-clamp-1 text-[14px] leading-[20px] text-text-2 transition-colors group-hover:text-text">
           {headline(item)}
         </span>
-        <RowUpdate item={item} />
+        <RowUpdate item={item} enabled={wantUpdate} />
       </button>
 
       <div className="flex shrink-0 items-center justify-between gap-[14px] md:justify-end">
@@ -765,7 +814,21 @@ function Row({
       </div>
     </div>
   );
-}
+}, (prev, next) => {
+  return (
+    prev.status === next.status &&
+    prev.item.id === next.item.id &&
+    prev.item.updatedAt === next.item.updatedAt &&
+    prev.item.mergeable === next.item.mergeable &&
+    prev.item.blockedReason === next.item.blockedReason &&
+    prev.item.problem === next.item.problem &&
+    prev.item.customer.email === next.item.customer.email &&
+    prev.item.customer.name === next.item.customer.name &&
+    prev.item.customer.phone === next.item.customer.phone &&
+    prev.item.gate.ciState === next.item.gate.ciState &&
+    prev.item.gate.unresolvedBotReviews === next.item.gate.unresolvedBotReviews
+  );
+});
 
 function StatusCell({
   item,
