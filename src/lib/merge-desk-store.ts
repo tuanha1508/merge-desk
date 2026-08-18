@@ -36,6 +36,7 @@ async function request(
   path: string,
   init?: RequestInit,
   params?: URLSearchParams,
+  quiet = false,
 ): Promise<Response | null> {
   if (!enabled()) return null;
   try {
@@ -49,15 +50,19 @@ async function request(
     });
     if (!response.ok) {
       const detail = (await response.text().catch(() => "")).slice(0, 300);
-      reportOnce(operation, `${response.status} ${detail || response.statusText}`);
+      if (!quiet) {
+        reportOnce(operation, `${response.status} ${detail || response.statusText}`);
+      }
       return null;
     }
     return response;
   } catch (error) {
-    reportOnce(
-      operation,
-      error instanceof Error ? error.message : "network error",
-    );
+    if (!quiet) {
+      reportOnce(
+        operation,
+        error instanceof Error ? error.message : "network error",
+      );
+    }
     return null;
   }
 }
@@ -128,6 +133,9 @@ export async function loadStoredQueue(
   }
 
   const items = rows.map((row) => row.payload).filter(isQueueItem);
+  // Over-cap snapshots mean webhook upserts grew past the product limit before
+  // trimming existed. Refuse them so the next full reconcile rebuilds cleanly.
+  if (state.item_count > config.maxPrs) return null;
   const expected = Math.min(maxItems, state.item_count);
   if (items.length !== expected) return null;
   return { items, itemCount: state.item_count, syncedAt: state.synced_at };
@@ -159,8 +167,27 @@ export async function upsertStoredQueueItems(
   items: QueueItem[],
 ): Promise<boolean> {
   if (!enabled() || items.length === 0) return false;
-  const response = await request(
+
+  // Prefer the capped RPC. Fall back to the older two-arg form plus a REST
+  // trim so deploys stay safe before the hardening migration is applied.
+  const capped = await request(
     "upsert queue",
+    "rpc/merge_desk_upsert_queue",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        items,
+        retention_days: config.maxPrAgeDays,
+        max_items: config.maxPrs,
+      }),
+    },
+    undefined,
+    true,
+  );
+  if (capped) return true;
+
+  const legacy = await request(
+    "upsert queue legacy",
     "rpc/merge_desk_upsert_queue",
     {
       method: "POST",
@@ -170,7 +197,58 @@ export async function upsertStoredQueueItems(
       }),
     },
   );
-  return Boolean(response);
+  if (!legacy) return false;
+  await trimStoredQueueToCap();
+  return true;
+}
+
+/** Drop oldest active rows when the durable set drifts past the product cap. */
+async function trimStoredQueueToCap(): Promise<void> {
+  const now = new Date().toISOString();
+  const listed = await request(
+    "list queue for trim",
+    config.mergeDeskQueueTable,
+    undefined,
+    new URLSearchParams({
+      select: "id",
+      expires_at: `gt.${now}`,
+      order: "updated_at.desc",
+    }),
+  );
+  if (!listed) return;
+  const rows = (await listed.json().catch(() => [])) as Array<{ id?: unknown }>;
+  const ids = rows
+    .map((row) => row.id)
+    .filter((id): id is string => typeof id === "string");
+  if (ids.length <= config.maxPrs) {
+    await refreshStoredQueueCount(ids.length);
+    return;
+  }
+  const drop = ids.slice(config.maxPrs);
+  const inList = drop.map((id) => `"${id.replace(/"/g, "")}"`).join(",");
+  await request(
+    "trim queue",
+    config.mergeDeskQueueTable,
+    {
+      method: "DELETE",
+      headers: headers("return=minimal"),
+    },
+    new URLSearchParams({ id: `in.(${inList})` }),
+  );
+  await refreshStoredQueueCount(config.maxPrs);
+}
+
+async function refreshStoredQueueCount(itemCount: number): Promise<void> {
+  await request(
+    "refresh queue count",
+    config.mergeDeskStateTable,
+    {
+      method: "PATCH",
+      headers: headers("return=minimal"),
+      body: JSON.stringify({ item_count: itemCount }),
+    },
+    new URLSearchParams({ key: "eq.queue" }),
+  );
 }
 
 /** Atomically replace the complete globally capped queue and mark it synced. */
@@ -254,6 +332,21 @@ export async function upsertStoredSummary(
 export async function cleanupExpiredRows(): Promise<void> {
   if (!enabled() || Date.now() - lastCleanupAt < CLEANUP_INTERVAL_MS) return;
   lastCleanupAt = Date.now();
+
+  const viaRpc = await request(
+    "clean expired",
+    "rpc/merge_desk_cleanup_expired",
+    {
+      method: "POST",
+      body: "{}",
+    },
+    undefined,
+    true,
+  );
+  if (viaRpc) return;
+
+  // Pre-hardening fallback: delete expired rows, then recompute item_count so
+  // the completeness marker cannot drift above the live row set.
   const expired = `lte.${new Date().toISOString()}`;
   await Promise.all([
     request(
@@ -269,4 +362,17 @@ export async function cleanupExpiredRows(): Promise<void> {
       new URLSearchParams({ expires_at: expired }),
     ),
   ]);
+
+  const listed = await request(
+    "count queue after clean",
+    config.mergeDeskQueueTable,
+    undefined,
+    new URLSearchParams({
+      select: "id",
+      expires_at: `gt.${new Date().toISOString()}`,
+    }),
+  );
+  if (!listed) return;
+  const rows = (await listed.json().catch(() => [])) as unknown[];
+  await refreshStoredQueueCount(rows.length);
 }

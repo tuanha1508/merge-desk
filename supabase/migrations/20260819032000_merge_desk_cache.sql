@@ -107,11 +107,13 @@ revoke all on function public.merge_desk_replace_queue(jsonb, integer)
 grant execute on function public.merge_desk_replace_queue(jsonb, integer)
   to service_role;
 
--- Patch one or more rows without claiming a full reconciliation. If a complete
--- snapshot already exists, keep its count accurate while preserving synced_at.
+-- Patch one or more rows without claiming a full reconciliation. Trims the
+-- active set to max_items so webhook growth cannot displace the real top set
+-- with an over-cap mixture of stale and fresh rows.
 create or replace function public.merge_desk_upsert_queue(
   items jsonb,
-  retention_days integer default 7
+  retention_days integer default 7,
+  max_items integer default 50
 )
 returns void
 language plpgsql
@@ -121,6 +123,9 @@ as $$
 begin
   if jsonb_typeof(items) <> 'array' then
     raise exception 'items must be a JSON array';
+  end if;
+  if max_items is null or max_items < 1 then
+    raise exception 'max_items must be >= 1';
   end if;
 
   insert into public.merge_desk_queue_items (
@@ -149,6 +154,15 @@ begin
     expires_at = excluded.expires_at,
     payload = excluded.payload,
     stored_at = excluded.stored_at;
+
+  delete from public.merge_desk_queue_items
+  where id in (
+    select id
+    from public.merge_desk_queue_items
+    where expires_at > now()
+    order by updated_at desc
+    offset max_items
+  );
 
   update public.merge_desk_state
   set item_count = (
@@ -179,11 +193,35 @@ begin
 end;
 $$;
 
-revoke all on function public.merge_desk_upsert_queue(jsonb, integer)
+create or replace function public.merge_desk_cleanup_expired()
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  delete from public.merge_desk_queue_items where expires_at <= now();
+  delete from public.merge_desk_summaries where expires_at <= now();
+
+  update public.merge_desk_state
+  set item_count = (
+    select count(*)::integer
+    from public.merge_desk_queue_items
+    where expires_at > now()
+  )
+  where key = 'queue';
+end;
+$$;
+
+revoke all on function public.merge_desk_upsert_queue(jsonb, integer, integer)
   from public, anon, authenticated;
 revoke all on function public.merge_desk_delete_queue(text)
   from public, anon, authenticated;
-grant execute on function public.merge_desk_upsert_queue(jsonb, integer)
+revoke all on function public.merge_desk_cleanup_expired()
+  from public, anon, authenticated;
+grant execute on function public.merge_desk_upsert_queue(jsonb, integer, integer)
   to service_role;
 grant execute on function public.merge_desk_delete_queue(text)
+  to service_role;
+grant execute on function public.merge_desk_cleanup_expired()
   to service_role;

@@ -571,7 +571,8 @@ export async function applyWebhookEvent(
 
   const number = evt.pr?.number;
   if (!number) {
-    invalidateQueueCache();
+    // Default-branch check_run deliveries carry no PR. Clearing the cache here
+    // forced every instance to rebuild after ordinary main CI noise.
     return { patched: false, action: "skipped", detail: "no pull request number" };
   }
 
