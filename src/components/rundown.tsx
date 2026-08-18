@@ -492,14 +492,7 @@ function Rail({
   return (
     <aside className="hidden w-[220px] shrink-0 flex-col gap-[20px] self-stretch bg-surface-2 px-[12px] pb-[16px] pt-[20px] md:flex">
       <div className="flex items-center gap-[9px] px-[8px] pb-[4px]">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src="/slashy.png"
-          alt="Slashy"
-          width={22}
-          height={22}
-          className="rounded-[6px]"
-        />
+        <BrandMark />
         <span className="text-[14px] font-semibold leading-[18px] tracking-[-0.01em] text-text">
           Merge control
         </span>
@@ -1437,6 +1430,35 @@ function Empty({ children }: { children: React.ReactNode }) {
 
 /* ------------------------------------------------------------------ icons */
 /* Paths taken verbatim from the Paper file so the build matches the design. */
+
+/**
+ * Neutral product mark: a git-merge glyph on an accent tile. Deliberately
+ * generic so the app carries no third-party branding - swap the glyph or tile
+ * colour to make it yours.
+ */
+function BrandMark() {
+  return (
+    <span
+      aria-hidden
+      className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[6px] bg-accent"
+    >
+      <svg
+        width="13"
+        height="13"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="white"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <circle cx="18" cy="18" r="3" />
+        <circle cx="6" cy="6" r="3" />
+        <path d="M6 21V9a9 9 0 0 0 9 9" />
+      </svg>
+    </span>
+  );
+}
 
 function IconTray() {
   return (

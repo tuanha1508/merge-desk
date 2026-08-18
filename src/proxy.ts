@@ -85,6 +85,6 @@ export const config = {
       GitHub's webhook receiver, and static assets. External services cannot
       present our login cookie; each exempt endpoint verifies its own secret.
     */
-    "/((?!login|api/login|api/slack|api/github/webhook|_next/static|_next/image|icon.png|favicon.ico).*)",
+    "/((?!login|api/login|api/slack|api/github/webhook|_next/static|_next/image|icon.svg|icon.png|favicon.ico).*)",
   ],
 };

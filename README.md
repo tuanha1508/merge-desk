@@ -103,23 +103,82 @@ are deleted immediately, and expired rows are cleaned daily. The migration
 enables RLS, grants access only to the service role, and uses a sync marker so
 the five-row first paint can never be mistaken for the complete queue.
 
-## Config
+## Connect your data
 
-See [`.env.example`](./.env.example). Minimum to go live:
+Merge Desk is a shell that joins your own tools together — it ships with **no
+data of its own**. Out of the box it runs in mock mode; to point it at real
+work, connect the services below. Each one is optional except GitHub, and the
+app degrades gracefully when a connection is missing (a PR with no ticket still
+lists and still merges; a PR with no resolved customer falls back to whoever
+filed it).
 
-| Variable | Purpose |
-|---|---|
-| `GITHUB_TOKEN` | Repo + merge access. Locally falls back to `gh auth token`. |
-| `GITHUB_REPOS` | Comma-separated `owner/repo` allowlist. |
-| `MQ_PASSWORD` | Shared sign-in password. **Required in production.** |
-| `LINEAR_API_KEY` | Ticket + customer lookup. |
-| `SUPABASE_*` / `POSTHOG_*` | Email resolution; Supabase also holds the shared 7-day queue and summary cache. |
-| `ANTHROPIC_API_KEY` | Boss updates + screenshot contact extraction. |
-| `OWN_EMAIL_DOMAINS` | e.g. `slashy.com,slashy.ai` — never treated as customers. |
-| `OWN_COMPANY_NAMES` | e.g. `Slashy` — same filter for display names. |
+Copy [`.env.example`](./.env.example) to `.env.local` and fill in what you have.
 
-Slack vars are documented in [`SLACK.md`](./SLACK.md) and left empty until
-that integration is turned on.
+### 1. GitHub — required
+
+The only connection you actually need. Without it the app stays in mock mode.
+
+- `GITHUB_TOKEN` — a token (classic or fine-grained) with `repo` scope so it can
+  read PRs, CI status, review threads, and perform the squash merge. Locally it
+  falls back to `gh auth token`; on a server you must set it explicitly.
+- `GITHUB_REPOS` — comma-separated `owner/repo` allowlist. This is also the
+  merge allowlist: the app will refuse to merge anything outside it.
+- `GITHUB_WEBHOOK_SECRET` — optional but recommended. Add a webhook in each repo
+  pointing at `/api/github/webhook` (events: pull request, check run, review
+  thread) so the board updates the instant a PR moves instead of on the poll.
+
+### 2. Linear — tickets & customers (optional)
+
+Turns a PR into "who reported this and why". Skip it and rows just show the PR
+title with no ticket or customer.
+
+- `LINEAR_API_KEY` — reads the issue referenced from the PR branch/title/body
+  (default pattern `SLA-####`, adjust in `src/lib/linear.ts`) plus any linked
+  Linear **customer** record.
+
+### 3. Customer lookup — Supabase & PostHog (optional)
+
+Used to turn a name in a ticket into a **reachable email**, when Linear alone
+can't. This is the part you tailor to your own backend — the queries in
+`src/lib/supabase.ts` and `src/lib/posthog.ts` assume a users table and a
+persons index; edit them to match your schema.
+
+- `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` — connect your product's user database.
+  `SUPABASE_USERS_TABLE` / `SUPABASE_EMAIL_COLUMN` name the table and email
+  column to search.
+- `POSTHOG_HOST`, `POSTHOG_PERSONAL_API_KEY`, `POSTHOG_PROJECT_ID` — look up a
+  person by name when they aren't in your DB yet.
+
+Supabase does double duty: if configured, it also stores the shared **7-day
+queue + summary cache** and powers live updates (below). Run the migration in
+`supabase/migrations/` once to create those tables.
+
+### 4. Boss updates — Anthropic (optional)
+
+- `ANTHROPIC_API_KEY` — generates the two-sentence, non-technical summary per
+  ticket and reads customer contacts out of ticket screenshots. Skip it and the
+  update section simply stays empty.
+- `ANTHROPIC_MODEL` — defaults to a Haiku model; override to trade cost/quality.
+
+### 5. Live updates — Supabase Realtime (optional)
+
+- `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` — let the browser
+  subscribe to a broadcast channel so the board refreshes within a second of a
+  change. The anon key is safe to expose: the ping carries no PR data and RLS
+  keeps that key out of every table. Leave blank to fall back to polling.
+
+### 6. Access control — always set before deploying
+
+- `MQ_PASSWORD` — shared sign-in password. **A production build with no password
+  refuses to serve.** This surface lists customer emails and can merge `main`.
+- `MQ_ACCESS_TOKENS` — optional machine tokens for scripts (`x-mq-token` header).
+- `OWN_EMAIL_DOMAINS` / `OWN_COMPANY_NAMES` — your own domains and names, so your
+  teammates are never mistaken for the customer being helped.
+
+### 7. Slack (optional)
+
+One card per newly mergeable PR, each with its own Merge button. See
+[`SLACK.md`](./SLACK.md); all `SLACK_*` vars stay empty until you turn it on.
 
 ## Signing in
 
