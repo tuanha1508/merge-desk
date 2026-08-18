@@ -1,6 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { config } from "@/lib/config";
-import { invalidateQueueCache } from "@/lib/queue";
+import {
+  applyWebhookEvent,
+  invalidateQueueCache,
+  type WebhookEvent,
+} from "@/lib/queue";
 
 const SIGNATURE_PREFIX = "sha256=";
 const ACCEPTED_EVENTS = new Set([
@@ -14,7 +18,62 @@ type GitHubPayload = {
   repository?: {
     full_name?: unknown;
   };
+  pull_request?: {
+    number?: unknown;
+    title?: unknown;
+    html_url?: unknown;
+    created_at?: unknown;
+    updated_at?: unknown;
+    state?: unknown;
+    draft?: unknown;
+    merged?: unknown;
+    head?: { ref?: unknown };
+    user?: { login?: unknown };
+  };
+  check_run?: {
+    pull_requests?: Array<{ number?: unknown }>;
+  };
 };
+
+function str(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function int(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+/**
+ * Pull the target PR out of whichever event shape carries it. pull_request and
+ * review-thread events nest a full `pull_request`; check_run events only list
+ * the PR numbers the run belongs to.
+ */
+function prFromPayload(payload: GitHubPayload): WebhookEvent["pr"] {
+  const p = payload.pull_request;
+  const number = int(p?.number);
+  if (p && number !== undefined) {
+    return {
+      number,
+      title: str(p.title),
+      author: str(p.user?.login),
+      url: str(p.html_url),
+      createdAt: str(p.created_at),
+      updatedAt: str(p.updated_at),
+      headRef: str(p.head?.ref),
+      state: str(p.state),
+      draft: typeof p.draft === "boolean" ? p.draft : undefined,
+      merged: typeof p.merged === "boolean" ? p.merged : undefined,
+    };
+  }
+
+  const fromCheck = payload.check_run?.pull_requests?.find(
+    (entry) => int(entry?.number) !== undefined,
+  );
+  const checkNumber = int(fromCheck?.number);
+  if (checkNumber !== undefined) return { number: checkNumber };
+
+  return null;
+}
 
 function validSignature(
   body: string,
@@ -93,13 +152,40 @@ export async function POST(request: Request) {
     });
   }
 
-  invalidateQueueCache();
+  const action = str(payload.action) ?? null;
+
+  /*
+    Patch the cache straight from the payload so the change is visible on the
+    next read: closed PRs drop out, new/edited PRs are (re)built, and CI or
+    review-thread events refresh only the affected gate. Any failure downgrades
+    to a plain cache clear so the next fetch simply rebuilds from GitHub, and we
+    still acknowledge with 200 so GitHub does not retry a delivery we received.
+  */
+  let outcome: Awaited<ReturnType<typeof applyWebhookEvent>>;
+  try {
+    outcome = await applyWebhookEvent({
+      event: event as WebhookEvent["event"],
+      action,
+      repo,
+      pr: prFromPayload(payload),
+    });
+  } catch (error) {
+    invalidateQueueCache();
+    outcome = {
+      patched: false,
+      action: "skipped",
+      detail: error instanceof Error ? error.message : "apply failed",
+    };
+  }
 
   return Response.json({
     ok: true,
     event,
-    action: typeof payload.action === "string" ? payload.action : null,
+    action,
     repo,
     delivery,
+    patched: outcome.patched,
+    patch: outcome.action,
+    detail: outcome.detail,
   });
 }

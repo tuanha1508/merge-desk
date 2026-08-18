@@ -1,10 +1,10 @@
 import { config, isMockMode } from "./config";
-import { listOpenPRs, type RawPR } from "./github";
+import { evaluateGate, listOpenPRs, type RawPR } from "./github";
 import { extractTicketRef, getTickets } from "./linear";
 import { resolveCustomer } from "./email-resolver";
 import { stripMarkdownNoise } from "./summarize";
 import { mockQueue } from "./mock";
-import type { QueueItem } from "./types";
+import type { QueueItem, ReviewGate } from "./types";
 
 const MEDIA_FILENAME =
   /^[\w\s.,'-]+\.(png|jpe?g|gif|webp|svg|pdf|mov|mp4|heic|zip)$/i;
@@ -364,4 +364,210 @@ export async function refreshQueueGates(
   const items = next.slice(0, maxItems);
   queueCache.set(maxItems, { at: Date.now(), items, missingRepos });
   return { mock: false, items, missingRepos, mode: "gates" };
+}
+
+/* ------------------------------------------------------------------ */
+/* Webhook fast-path: patch cached rows straight from GitHub events.  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Live (non-expired) cache entries, pruning any that have aged out. Every
+ * webhook patch touches all of them so a page asking for 5 rows and a poll
+ * asking for 50 stay consistent.
+ */
+function liveEntries(): Array<[number, CacheEntry]> {
+  const now = Date.now();
+  const out: Array<[number, CacheEntry]> = [];
+  for (const [size, entry] of queueCache) {
+    if (now - entry.at > CACHE_TTL_MS) {
+      queueCache.delete(size);
+      continue;
+    }
+    out.push([size, entry]);
+  }
+  return out;
+}
+
+function queueHasItem(repo: string, number: number): boolean {
+  const id = `${repo}#${number}`;
+  return liveEntries().some(([, entry]) =>
+    entry.items.some((item) => item.id === id),
+  );
+}
+
+/** Drop one PR from every cached page. Returns whether anything changed. */
+function removeQueueItem(repo: string, number: number): boolean {
+  const id = `${repo}#${number}`;
+  let changed = false;
+  for (const [, entry] of liveEntries()) {
+    const before = entry.items.length;
+    entry.items = entry.items.filter((item) => item.id !== id);
+    if (entry.items.length !== before) changed = true;
+  }
+  return changed;
+}
+
+/** Stamp a freshly-evaluated gate onto one PR wherever it is cached. */
+function patchQueueGate(
+  repo: string,
+  number: number,
+  gate: ReviewGate,
+): boolean {
+  const id = `${repo}#${number}`;
+  let changed = false;
+  for (const [, entry] of liveEntries()) {
+    entry.items = entry.items.map((item) => {
+      if (item.id !== id) return item;
+      changed = true;
+      const next = { ...item, gate };
+      return { ...next, ...decideMerge(next) };
+    });
+  }
+  return changed;
+}
+
+/** Insert or replace one enriched row in every cached page, then re-order. */
+function upsertQueueItem(item: QueueItem): void {
+  for (const [size, entry] of liveEntries()) {
+    const without = entry.items.filter((existing) => existing.id !== item.id);
+    without.push(item);
+    without.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    entry.items = without.slice(0, size);
+  }
+}
+
+export interface WebhookEvent {
+  event: "pull_request" | "check_run" | "pull_request_review_thread";
+  action: string | null;
+  repo: string;
+  pr: {
+    number: number;
+    title?: string;
+    author?: string;
+    url?: string;
+    createdAt?: string;
+    updatedAt?: string;
+    headRef?: string;
+    state?: string;
+    draft?: boolean;
+    merged?: boolean;
+  } | null;
+}
+
+export interface WebhookOutcome {
+  patched: boolean;
+  action: "removed" | "upserted" | "gate-refreshed" | "skipped";
+  detail?: string;
+}
+
+async function upsertFromWebhookPR(
+  repo: string,
+  pr: NonNullable<WebhookEvent["pr"]>,
+): Promise<WebhookOutcome> {
+  if (
+    !pr.title ||
+    !pr.author ||
+    !pr.url ||
+    !pr.createdAt ||
+    !pr.updatedAt ||
+    pr.headRef === undefined
+  ) {
+    invalidateQueueCache();
+    return {
+      patched: false,
+      action: "skipped",
+      detail: "incomplete pull_request payload",
+    };
+  }
+
+  // A PR whose last activity is older than the list cutoff would never appear
+  // in a normal fetch, so it must not be injected here either.
+  const cutoff = Date.now() - config.maxPrAgeDays * 24 * 60 * 60 * 1000;
+  if (new Date(pr.updatedAt).getTime() < cutoff) {
+    const removed = removeQueueItem(repo, pr.number);
+    return { patched: removed, action: "removed", detail: "outside active window" };
+  }
+
+  // Nothing is holding this repo's rows right now; the next fetch will include
+  // the PR anyway, so skip the enrichment work.
+  if (liveEntries().length === 0) {
+    return { patched: false, action: "skipped", detail: "no live cache" };
+  }
+
+  // The payload carries title/author/timestamps but not the CI rollup or
+  // review threads, so the gate is evaluated fresh.
+  const gate = await evaluateGate(repo, pr.number).catch(() => null);
+  if (!gate) {
+    invalidateQueueCache();
+    return { patched: false, action: "skipped", detail: "gate lookup failed" };
+  }
+
+  const raw: RawPR = {
+    repo,
+    number: pr.number,
+    title: pr.title,
+    author: pr.author,
+    url: pr.url,
+    createdAt: pr.createdAt,
+    updatedAt: pr.updatedAt,
+    headRef: pr.headRef,
+    gate,
+  };
+  const [item] = await enrichPRs([raw], false);
+  upsertQueueItem(item);
+  return { patched: true, action: "upserted" };
+}
+
+/**
+ * Apply a verified GitHub webhook to this process's queue cache so the change
+ * shows up on the very next read instead of after a poll.
+ *
+ * The cache is per-instance and best-effort: a delivery may land on a warm
+ * instance that is not the one serving a given browser. That is acceptable -
+ * anything not patched here is still corrected by the 45s cache window and the
+ * client poll. When a patch cannot be made confidently, the cache is cleared so
+ * the next read rebuilds from GitHub rather than serving something stale.
+ */
+export async function applyWebhookEvent(
+  evt: WebhookEvent,
+): Promise<WebhookOutcome> {
+  if (isMockMode) {
+    return { patched: false, action: "skipped", detail: "mock mode" };
+  }
+
+  const number = evt.pr?.number;
+  if (!number) {
+    invalidateQueueCache();
+    return { patched: false, action: "skipped", detail: "no pull request number" };
+  }
+
+  if (evt.event === "pull_request") {
+    // Merged, closed or turned-into-draft PRs leave the board immediately -
+    // the cheapest, highest-value patch, and it needs no API call.
+    if (
+      evt.action === "closed" ||
+      evt.pr?.state === "closed" ||
+      evt.action === "converted_to_draft" ||
+      evt.pr?.draft === true
+    ) {
+      const removed = removeQueueItem(evt.repo, number);
+      return { patched: removed, action: "removed" };
+    }
+    // opened / reopened / ready_for_review / edited / synchronize: (re)build the
+    // row so its ticket, customer and gate match a normal fetch.
+    return upsertFromWebhookPR(evt.repo, evt.pr!);
+  }
+
+  // check_run + review-thread events only move the gate. Ignoring one for a PR
+  // we are not holding costs nothing and avoids a pointless API call.
+  if (!queueHasItem(evt.repo, number)) {
+    return { patched: false, action: "skipped", detail: "pr not cached" };
+  }
+  const gate = await evaluateGate(evt.repo, number).catch(() => null);
+  if (!gate) {
+    invalidateQueueCache();
+    return { patched: false, action: "skipped", detail: "gate lookup failed" };
+  }
+  const changed = patchQueueGate(evt.repo, number, gate);
+  return { patched: changed, action: "gate-refreshed" };
 }
