@@ -1,6 +1,6 @@
 import { config, isMockMode } from "./config";
 import { evaluateGate, mergePR } from "./github";
-import { invalidateQueueCache } from "./queue";
+import { invalidateQueueCache, removeQueueItemEverywhere } from "./queue";
 import type { MergeResult } from "./types";
 
 export interface QueueMergeResult {
@@ -79,7 +79,10 @@ export async function mergeQueueItem(
   }
 
   const merged = await mergePR(repo, number);
-  if (merged.merged) invalidateQueueCache();
+  if (merged.merged) {
+    invalidateQueueCache();
+    await removeQueueItemEverywhere(repo, number);
+  }
   return {
     result: { ok: merged.merged, ...merged },
     status: merged.merged ? 200 : 409,

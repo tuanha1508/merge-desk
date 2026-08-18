@@ -57,6 +57,12 @@ export const config = {
   supabaseKey: env("SUPABASE_SERVICE_KEY") ?? env("SUPABASE_SERVICE_ROLE_KEY"),
   supabaseTable: env("SUPABASE_USERS_TABLE") ?? "users",
   supabaseEmailCol: env("SUPABASE_EMAIL_COLUMN") ?? "email",
+  mergeDeskQueueTable:
+    env("MERGE_DESK_QUEUE_TABLE") ?? "merge_desk_queue_items",
+  mergeDeskSummaryTable:
+    env("MERGE_DESK_SUMMARY_TABLE") ?? "merge_desk_summaries",
+  mergeDeskStateTable:
+    env("MERGE_DESK_STATE_TABLE") ?? "merge_desk_state",
 
   posthogHost: env("POSTHOG_HOST") ?? env("POSTHOG_APP_HOST") ?? "https://us.posthog.com",
   // Persons search needs the personal API key, not the project key.

@@ -2,9 +2,17 @@ import { config, isMockMode } from "./config";
 import { evaluateGate, listOpenPRs, type RawPR } from "./github";
 import { extractTicketRef, getTickets } from "./linear";
 import { resolveCustomer } from "./email-resolver";
+import {
+  cleanupExpiredRows,
+  deleteStoredQueueItem,
+  loadStoredQueue,
+  loadStoredQueueItem,
+  replaceStoredQueue,
+  upsertStoredQueueItems,
+} from "./merge-desk-store";
 import { stripMarkdownNoise } from "./summarize";
 import { mockQueue } from "./mock";
-import type { QueueItem, ReviewGate } from "./types";
+import type { QueueItem } from "./types";
 
 const MEDIA_FILENAME =
   /^[\w\s.,'-]+\.(png|jpe?g|gif|webp|svg|pdf|mov|mp4|heic|zip)$/i;
@@ -167,6 +175,9 @@ async function mapWithConcurrency<T, R>(
   path re-checks its gates against GitHub regardless of what this holds.
 */
 const CACHE_TTL_MS = 45_000;
+// Webhooks keep the durable snapshot current between reconciliations. A full
+// GitHub read every 15 minutes repairs any delivery GitHub or Vercel missed.
+const DURABLE_SYNC_TTL_MS = 15 * 60_000;
 
 type CacheEntry = { at: number; items: QueueItem[]; missingRepos: string[] };
 const queueCache = new Map<number, CacheEntry>();
@@ -197,7 +208,7 @@ export interface QueueResult {
   /** Repos GitHub could not serve. Their rows are absent from `items`. */
   missingRepos: string[];
   /** Whether this payload reused prior enrichment and only refreshed gates. */
-  mode?: "full" | "gates";
+  mode?: "full" | "gates" | "db";
 }
 
 export interface GetQueueOptions {
@@ -296,12 +307,45 @@ export async function getQueue(
         mode: "full",
       };
     }
+
+    const stored = await loadStoredQueue(maxItems);
+    if (stored) {
+      const syncedAt = new Date(stored.syncedAt).getTime();
+      const fresh =
+        Number.isFinite(syncedAt) &&
+        Date.now() - syncedAt <= DURABLE_SYNC_TTL_MS;
+      // A stale snapshot is still ideal for the five-row SSR first paint. The
+      // client's immediate 50-row fill reaches the branch below and performs
+      // the reconciliation before declaring the queue filled.
+      if (fresh || maxItems < config.maxPrs) {
+        queueCache.set(maxItems, {
+          at: Date.now(),
+          items: stored.items,
+          missingRepos: [],
+        });
+        return {
+          mock: false,
+          items: stored.items,
+          missingRepos: [],
+          mode: "db",
+        };
+      }
+    }
   }
 
   const { capped, missingRepos } = await listAllOpenPRs(maxItems);
   const items = await enrichPRs(capped, allowVision);
   if (!allowVision) {
     queueCache.set(maxItems, { at: Date.now(), items, missingRepos });
+    // Only the global 50-row request proves the snapshot is complete. A
+    // partial first-paint request can add useful rows but never advances the
+    // durable sync marker.
+    if (maxItems === config.maxPrs && missingRepos.length === 0) {
+      await replaceStoredQueue(items);
+      await cleanupExpiredRows();
+    } else {
+      await upsertStoredQueueItems(items);
+    }
   }
   return { mock: false, items, missingRepos, mode: "full" };
 }
@@ -363,6 +407,11 @@ export async function refreshQueueGates(
   next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   const items = next.slice(0, maxItems);
   queueCache.set(maxItems, { at: Date.now(), items, missingRepos });
+  if (maxItems === config.maxPrs && missingRepos.length === 0) {
+    await replaceStoredQueue(items);
+  } else {
+    await upsertStoredQueueItems(items);
+  }
   return { mock: false, items, missingRepos, mode: "gates" };
 }
 
@@ -388,11 +437,13 @@ function liveEntries(): Array<[number, CacheEntry]> {
   return out;
 }
 
-function queueHasItem(repo: string, number: number): boolean {
+function cachedQueueItem(repo: string, number: number): QueueItem | null {
   const id = `${repo}#${number}`;
-  return liveEntries().some(([, entry]) =>
-    entry.items.some((item) => item.id === id),
-  );
+  for (const [, entry] of liveEntries()) {
+    const item = entry.items.find((candidate) => candidate.id === id);
+    if (item) return item;
+  }
+  return null;
 }
 
 /** Drop one PR from every cached page. Returns whether anything changed. */
@@ -407,23 +458,14 @@ function removeQueueItem(repo: string, number: number): boolean {
   return changed;
 }
 
-/** Stamp a freshly-evaluated gate onto one PR wherever it is cached. */
-function patchQueueGate(
+/** Remove a merged/closed PR from memory and the shared durable snapshot. */
+export async function removeQueueItemEverywhere(
   repo: string,
   number: number,
-  gate: ReviewGate,
-): boolean {
-  const id = `${repo}#${number}`;
-  let changed = false;
-  for (const [, entry] of liveEntries()) {
-    entry.items = entry.items.map((item) => {
-      if (item.id !== id) return item;
-      changed = true;
-      const next = { ...item, gate };
-      return { ...next, ...decideMerge(next) };
-    });
-  }
-  return changed;
+): Promise<boolean> {
+  const changed = removeQueueItem(repo, number);
+  const deleted = await deleteStoredQueueItem(`${repo}#${number}`);
+  return changed || deleted;
 }
 
 /** Insert or replace one enriched row in every cached page, then re-order. */
@@ -484,14 +526,8 @@ async function upsertFromWebhookPR(
   // in a normal fetch, so it must not be injected here either.
   const cutoff = Date.now() - config.maxPrAgeDays * 24 * 60 * 60 * 1000;
   if (new Date(pr.updatedAt).getTime() < cutoff) {
-    const removed = removeQueueItem(repo, pr.number);
+    const removed = await removeQueueItemEverywhere(repo, pr.number);
     return { patched: removed, action: "removed", detail: "outside active window" };
-  }
-
-  // Nothing is holding this repo's rows right now; the next fetch will include
-  // the PR anyway, so skip the enrichment work.
-  if (liveEntries().length === 0) {
-    return { patched: false, action: "skipped", detail: "no live cache" };
   }
 
   // The payload carries title/author/timestamps but not the CI rollup or
@@ -515,18 +551,16 @@ async function upsertFromWebhookPR(
   };
   const [item] = await enrichPRs([raw], false);
   upsertQueueItem(item);
+  await upsertStoredQueueItems([item]);
   return { patched: true, action: "upserted" };
 }
 
 /**
- * Apply a verified GitHub webhook to this process's queue cache so the change
- * shows up on the very next read instead of after a poll.
+ * Apply a verified GitHub webhook to the shared Supabase snapshot and this
+ * process's L1 cache so every Vercel instance sees the same next read.
  *
- * The cache is per-instance and best-effort: a delivery may land on a warm
- * instance that is not the one serving a given browser. That is acceptable -
- * anything not patched here is still corrected by the 45s cache window and the
- * client poll. When a patch cannot be made confidently, the cache is cleared so
- * the next read rebuilds from GitHub rather than serving something stale.
+ * When a patch cannot be made confidently, the L1 cache is cleared so the next
+ * read reconciles instead of serving something stale.
  */
 export async function applyWebhookEvent(
   evt: WebhookEvent,
@@ -550,7 +584,7 @@ export async function applyWebhookEvent(
       evt.action === "converted_to_draft" ||
       evt.pr?.draft === true
     ) {
-      const removed = removeQueueItem(evt.repo, number);
+      const removed = await removeQueueItemEverywhere(evt.repo, number);
       return { patched: removed, action: "removed" };
     }
     // opened / reopened / ready_for_review / edited / synchronize: (re)build the
@@ -558,9 +592,12 @@ export async function applyWebhookEvent(
     return upsertFromWebhookPR(evt.repo, evt.pr!);
   }
 
-  // check_run + review-thread events only move the gate. Ignoring one for a PR
-  // we are not holding costs nothing and avoids a pointless API call.
-  if (!queueHasItem(evt.repo, number)) {
+  // check_run + review-thread events only move the gate. A cold webhook
+  // instance can recover the row from Supabase before evaluating the gate.
+  const id = `${evt.repo}#${number}`;
+  const existing =
+    cachedQueueItem(evt.repo, number) ?? (await loadStoredQueueItem(id));
+  if (!existing) {
     return { patched: false, action: "skipped", detail: "pr not cached" };
   }
   const gate = await evaluateGate(evt.repo, number).catch(() => null);
@@ -568,6 +605,9 @@ export async function applyWebhookEvent(
     invalidateQueueCache();
     return { patched: false, action: "skipped", detail: "gate lookup failed" };
   }
-  const changed = patchQueueGate(evt.repo, number, gate);
-  return { patched: changed, action: "gate-refreshed" };
+  const next = { ...existing, gate };
+  const patched = { ...next, ...decideMerge(next) };
+  upsertQueueItem(patched);
+  await upsertStoredQueueItems([patched]);
+  return { patched: true, action: "gate-refreshed" };
 }

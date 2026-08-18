@@ -21,7 +21,7 @@ Two actions per row: **Merge** and **View PR**. Nothing else.
   to whoever filed the ticket.
 - **Boss update** — a two-sentence, non-technical summary (under 45 words)
   grounded in the ticket and PR. Shown on every row, cached across refreshes
-  in `localStorage`, and copyable from the detail view.
+  in `localStorage` and Supabase, and copyable from the detail view.
 - **Merge gates** — CI must be green, and there must be no unresolved bot
   review threads. Re-checked server-side on every merge, for both the web UI
   and Slack. Merged rows slide off the board.
@@ -34,6 +34,7 @@ Two actions per row: **Merge** and **View PR**. Nothing else.
 npm install
 cp .env.example .env.local
 # fill in tokens — see Config below
+# run supabase/migrations/20260819032000_merge_desk_cache.sql once
 npm run dev
 # http://localhost:3939
 ```
@@ -62,7 +63,15 @@ visible immediately. Merges in mock mode never touch GitHub.
    the GitHub call so a stale button cannot bypass them.
 
 First paint loads the newest 5 rows; the rest fill in behind a "Polling more"
-indicator. A short server-side cache (45s) keeps subsequent polls cheap.
+indicator. A 45-second memory cache sits in front of a shared Supabase snapshot,
+so cold Vercel instances render without repeating GitHub, Linear, and customer
+lookups. Webhooks patch that snapshot directly; a full reconciliation every 15
+minutes repairs missed deliveries.
+
+Queue rows and generated summaries expire after 7 days. Closed or merged PRs
+are deleted immediately, and expired rows are cleaned daily. The migration
+enables RLS, grants access only to the service role, and uses a sync marker so
+the five-row first paint can never be mistaken for the complete queue.
 
 ## Config
 
@@ -74,7 +83,7 @@ See [`.env.example`](./.env.example). Minimum to go live:
 | `GITHUB_REPOS` | Comma-separated `owner/repo` allowlist. |
 | `MQ_PASSWORD` | Shared sign-in password. **Required in production.** |
 | `LINEAR_API_KEY` | Ticket + customer lookup. |
-| `SUPABASE_*` / `POSTHOG_*` | Email resolution backends. |
+| `SUPABASE_*` / `POSTHOG_*` | Email resolution; Supabase also holds the shared 7-day queue and summary cache. |
 | `ANTHROPIC_API_KEY` | Boss updates + screenshot contact extraction. |
 | `OWN_EMAIL_DOMAINS` | e.g. `slashy.com,slashy.ai` — never treated as customers. |
 | `OWN_COMPANY_NAMES` | e.g. `Slashy` — same filter for display names. |
@@ -114,9 +123,10 @@ vercel deploy --prod
 
 ## Stack
 
-Next.js 16 (App Router) + React 19 + Tailwind v4. No database. Integrations
-are plain `fetch`. Auth is an HMAC-signed cookie verified at the edge
-(`src/proxy.ts`) and again in Node for API routes.
+Next.js 16 (App Router) + React 19 + Tailwind v4 + Supabase Postgres.
+Integrations use plain `fetch` through server-only routes. Auth is an
+HMAC-signed cookie verified at the edge (`src/proxy.ts`) and again in Node for
+API routes.
 
 ## Product principles
 

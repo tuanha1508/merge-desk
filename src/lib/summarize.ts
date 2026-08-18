@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import { config } from "./config";
+import {
+  loadStoredSummary,
+  upsertStoredSummary,
+} from "./merge-desk-store";
 
 /**
  * The boss update spec, verbatim. Locked - the only variable is the input.
@@ -187,11 +191,19 @@ async function callModel(messages: Msg[]): Promise<string | null> {
 export async function summarizeForBoss(
   input: SummaryInput,
 ): Promise<string | null> {
-  if (!config.anthropicKey) return null;
-
   const ck = cacheKey(input, SYSTEM_PROMPT);
   const cached = cache.get(ck);
   if (cached) return cached;
+
+  const stored = await loadStoredSummary(ck);
+  if (stored) {
+    remember(ck, stored);
+    return stored;
+  }
+
+  // A durable cache hit remains usable even if the model key is temporarily
+  // absent; only a genuine cache miss requires Anthropic.
+  if (!config.anthropicKey) return null;
 
   const problem = stripMarkdownNoise(input.ticketBody).slice(0, 4000);
   const prBody = stripMarkdownNoise(input.prBody ?? "").slice(0, 2000);
@@ -220,6 +232,7 @@ export async function summarizeForBoss(
     const breach = specViolation(clean);
     if (!breach) {
       remember(ck, clean);
+      await upsertStoredSummary(ck, input.key, clean);
       return clean;
     }
 
@@ -229,6 +242,10 @@ export async function summarizeForBoss(
   }
 
   // Still off-spec. Long is forwardable with a glance; commentary is not.
-  if (draft && !isUnusable(draft)) return draft;
+  if (draft && !isUnusable(draft)) {
+    remember(ck, draft);
+    await upsertStoredSummary(ck, input.key, draft);
+    return draft;
+  }
   return null;
 }
