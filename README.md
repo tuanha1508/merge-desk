@@ -1,13 +1,27 @@
 # Merge Desk
 
-Internal merge control for Slashy's CTO: every open PR across the watched
-repos, tied to the customer who reported it, with a one-click merge that only
-lights up when the gates are green.
+A merge-control desk for a CTO: every open PR across watched repos, tied to the
+customer who reported it, with a one-click merge that only lights up when the
+gates are green.
 
-Live: **https://merge-desk.vercel.app**  
 Repo: **https://github.com/tuanha1508/merge-desk**
 
 Two actions per row: **Merge** and **View PR**. Nothing else.
+
+<p align="center">
+  <img src="docs/screenshots/inbox.png" alt="Merge Desk inbox in mock mode" width="900" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/detail.png" alt="PR detail with boss update and gates" width="720" />
+  &nbsp;
+  <img src="docs/screenshots/blocked.png" alt="PR blocked by a fake Claude bot review" width="720" />
+</p>
+
+> **Try it without credentials.** `npm install && npm run dev` runs in mock
+> mode with invented customers, tickets, and a fake Claude bot review. Merges
+> never touch GitHub. The production deploy (if any) stays password-gated and
+> is not part of the public demo.
 
 ## What it does
 
@@ -42,6 +56,14 @@ npm run dev
 
 With no GitHub token / repos, it runs in **mock mode** (fake PRs) so the UX is
 visible immediately. Merges in mock mode never touch GitHub.
+
+## Public repo notes
+
+- `.env` / `.env.local` are gitignored. Never commit real tokens.
+- Mock data in `src/lib/mock.ts` is invented on purpose (Northwind, Globex,
+  Contoso, a fake `claude[bot]` review) so screenshots and clones stay safe.
+- A live deploy with real customer emails should stay private / password-gated;
+  this repository is the portfolio surface, not the production data plane.
 
 ## How a row is built
 

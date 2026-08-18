@@ -56,11 +56,12 @@ GitHub shows pull requests; Linear shows tickets; the customer's email lives in 
 
 ## Evidence on Hand
 
-- Working app in this repository, live at https://merge-desk.vercel.app against
-  real GitHub, Linear, Supabase, and PostHog credentials in `.env.local`.
-- Real ticket and customer data observed during development, including `SLA-6904` (dark mode rendering) and `SLA-6794`.
-- `src/lib/mock.ts` provides fallback data when credentials are absent.
-- No pricing, customer count, SLA guarantee, or performance benchmark has been established; none may be invented.
+- Working app in this repository. A password-gated production deploy may exist
+  for internal use; the public repo is meant to be explored in **mock mode**.
+- `src/lib/mock.ts` ships invented customers, tickets, and bot reviews so the
+  UX is visible with zero credentials and nothing sensitive in screenshots.
+- No pricing, customer count, SLA guarantee, or performance benchmark has been
+  established; none may be invented.
 
 ## Product Principles
 
