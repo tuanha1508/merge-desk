@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/wordmark.png" alt="Merge Desk" width="620" />
+# Merge Desk
 
 ### One screen to clear your merge queue — every open PR, the customer who reported it, and a one-click merge that only lights up when the gates are green.
 
