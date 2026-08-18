@@ -56,7 +56,8 @@ GitHub shows pull requests; Linear shows tickets; the customer's email lives in 
 
 ## Evidence on Hand
 
-- Working app at `merge-queue/`, live against real GitHub, Linear, Supabase, and PostHog credentials in `.env.local`.
+- Working app in this repository, live at https://merge-desk.vercel.app against
+  real GitHub, Linear, Supabase, and PostHog credentials in `.env.local`.
 - Real ticket and customer data observed during development, including `SLA-6904` (dark mode rendering) and `SLA-6794`.
 - `src/lib/mock.ts` provides fallback data when credentials are absent.
 - No pricing, customer count, SLA guarantee, or performance benchmark has been established; none may be invented.
